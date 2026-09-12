@@ -1,0 +1,269 @@
+#!/usr/bin/python -I
+"""Sync Omarchy's selected theme to Limine without changing boot entries."""
+import argparse
+import base64
+import difflib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+PROGRAM = '/usr/local/bin/omarchy-limine-theme'
+BOOT = Path('/boot')
+STATE = Path('/var/lib/omarchy-limine-theme')
+CONFIG = 'limine.conf'
+EFI = 'EFI/limine/limine_x64.efi'
+CERT = Path('/var/lib/sbctl/keys/db/db.pem')
+LIMIT = 32 * 1024 * 1024
+COLOR = re.compile(r'#[0-9a-fA-F]{6}')
+ASSET = re.compile(r'limine-theme-[0-9a-f]{128}\.(png|jpg|bmp|qoi)')
+
+
+def read_limited(path, limit=LIMIT):
+    with Path(path).open('rb') as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f'{path}: exceeds {limit} bytes')
+    return data
+
+
+def image_type(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n') and len(data) >= 33:
+        width, height = struct.unpack('>II', data[16:24])
+        if data[12:16] != b'IHDR' or not 0 < width * height <= 64_000_000:
+            raise ValueError('Invalid or oversized PNG dimensions')
+        return 'png'
+    for magic, extension in ((b'\xff\xd8\xff', 'jpg'), (b'BM', 'bmp'), (b'qoif', 'qoi')):
+        if data.startswith(magic) and len(data) > 32:
+            return extension
+    raise ValueError('Wallpaper must be a static PNG, JPEG, BMP, or QOI image')
+
+
+def decode_payload(raw):
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or set(payload) != {'colors', 'image'}:
+        raise ValueError('Expected colors and image only')
+    colors = payload['colors']
+    if not isinstance(colors, dict) or len(colors) > 100:
+        raise ValueError('Invalid palette')
+    if any(not isinstance(k, str) or not isinstance(v, str) or not COLOR.fullmatch(v)
+           for k, v in colors.items()):
+        raise ValueError('Palette values must be six-digit hex colors')
+    if not {'background', 'foreground', 'accent'} <= colors.keys():
+        raise ValueError('Theme needs background, foreground, and accent colors')
+    data = base64.b64decode(payload['image'], validate=True)
+    if not 0 < len(data) <= LIMIT:
+        raise ValueError('Wallpaper exceeds 32 MiB')
+    return colors, data, image_type(data)
+
+
+def theme_payload():
+    current = Path.home() / '.local/state/omarchy/current'
+    palette = tomllib.loads(read_limited(current / 'theme/colors.toml', 65536).decode())
+    colors = {k: v for k, v in palette.items() if isinstance(v, str) and COLOR.fullmatch(v)}
+    data = read_limited(current / 'background')
+    raw = json.dumps({'colors': colors, 'image': base64.b64encode(data).decode()}).encode()
+    decode_payload(raw)
+    return raw
+
+
+def appearance(colors, image, extension):
+    def color(name, fallback='foreground'):
+        return colors.get(name, colors[fallback]).lstrip('#').lower()
+    digest = hashlib.blake2b(image).hexdigest()
+    values = {
+        'wallpaper': f'boot():/limine-theme-{digest}.{extension}#{digest}',
+        'wallpaper_style': 'stretched',
+        'backdrop': color('darker_background', 'background'),
+        'term_background': '70' + color('darker_background', 'background'),
+        'term_foreground': color('foreground'),
+        'term_foreground_bright': color('bright_foreground'),
+        'term_background_bright': color('selection', 'background'),
+        'interface_branding_color': color('accent'),
+        'interface_help_color': color('dark_foreground'),
+        'interface_help_color_bright': color('accent'),
+    }
+    names = ('background', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'foreground')
+    values['term_palette'] = ';'.join(color(n) for n in names)
+    values['term_palette_bright'] = ';'.join(color('bright_' + n, n if n in colors else 'foreground') for n in names)
+    return values
+
+
+def split_config(config):
+    match = re.search(r'(?m)^\s*/', config)
+    if not match:
+        raise ValueError('No Limine boot entries found')
+    return config[:match.start()], config[match.start():]
+
+
+def render(config, values):
+    header, entries = split_config(config)
+    # Handle Limine's British-spelling aliases as the same global option.
+    normalize = lambda key: key.lower().replace('colour', 'color')
+    managed = set(values)
+    option = re.compile(r'^\s*([a-zA-Z_]+)\s*:')
+    for line in entries.splitlines():
+        match = option.match(line)
+        if match and normalize(match[1]) in managed:
+            raise ValueError('Managed appearance options must precede the first boot entry')
+    lines = []
+    for line in header.splitlines(keepends=True):
+        match = option.match(line)
+        if not match or normalize(match[1]) not in managed:
+            lines.append(line)
+    result = ''.join(lines).rstrip('\n') + '\n'
+    result += ''.join(f'{key}: {value}\n' for key, value in values.items())
+    return result + entries
+
+
+def restore_appearance(current, previous):
+    old_header, _ = split_config(previous)
+    keys = set(appearance({'background': '#000000', 'foreground': '#ffffff', 'accent': '#ffffff'}, b'', 'png'))
+    values = {}
+    for line in old_header.splitlines():
+        match = re.match(r'^\s*([a-zA-Z_]+)\s*:\s*(.*)$', line)
+        if match and match[1].lower().replace('colour', 'color') in keys:
+            values[match[1].lower().replace('colour', 'color')] = match[2]
+    header, entries = split_config(current)
+    header = ''.join(line for line in header.splitlines(keepends=True)
+                     if line.split(':', 1)[0].strip().lower().replace('colour', 'color') not in keys)
+    return render(header + entries, values)
+
+
+def atomic_write(path, data, mode=0o600):
+    fd, temporary = tempfile.mkstemp(prefix='.limine-theme-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def secure_boot_enabled():
+    value = Path('/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c')
+    return value.exists() and value.read_bytes()[4:5] == b'\x01'
+
+
+def verify_signing_ready():
+    if secure_boot_enabled():
+        der = ssl.PEM_cert_to_DER_cert(CERT.read_text())
+        db = Path('/sys/firmware/efi/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f').read_bytes()
+        if der not in db:
+            raise ValueError('The sbctl signing certificate is not enrolled in firmware db')
+
+
+def sign_and_verify():
+    subprocess.run(['/usr/bin/limine-enroll-config'], check=True)
+    if CERT.exists():
+        subprocess.run(['/usr/bin/sbverify', '--cert', str(CERT), str(BOOT / EFI)], check=True)
+    elif secure_boot_enabled():
+        raise ValueError('Secure Boot is enabled but no sbctl certificate is available')
+
+
+def apply_transaction(config, image=None, filename=None, signer=sign_and_verify):
+    """Caller holds the boot-partition lock. Keep signed EFI and config together."""
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='backup-', dir=STATE))
+    for source, name in ((BOOT / CONFIG, 'limine.conf'), (BOOT / EFI, 'limine_x64.efi')):
+        shutil.copyfile(source, backup / name)
+    created = None
+    try:
+        if image is not None:
+            asset = BOOT / filename
+            if asset.exists():
+                if asset.read_bytes() != image:
+                    raise ValueError('Wallpaper hash collision or altered asset')
+            else:
+                atomic_write(asset, image, 0o644)
+                created = asset
+        atomic_write(BOOT / CONFIG, config.encode())
+        signer()
+        subprocess.run(['/usr/bin/sync', '-f', str(BOOT)], check=True)
+    except BaseException:
+        atomic_write(BOOT / CONFIG, (backup / 'limine.conf').read_bytes())
+        atomic_write(BOOT / EFI, (backup / 'limine_x64.efi').read_bytes())
+        if created:
+            created.unlink(missing_ok=True)
+        subprocess.run(['/usr/bin/sync', '-f', str(BOOT)], check=True)
+        raise
+    atomic_write(STATE / 'latest', backup.name.encode())
+    # Keep three recovery points and only their referenced, plugin-owned images.
+    backups = sorted(STATE.glob('backup-*'), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[3:]:
+        shutil.rmtree(old)
+    references = config + ''.join((p / CONFIG).read_text() for p in backups[:3])
+    for asset in BOOT.glob('limine-theme-*'):
+        if ASSET.fullmatch(asset.name) and asset.name not in references:
+            asset.unlink()
+    return backup
+
+
+def privileged(action, raw):
+    if os.geteuid() != 0:
+        raise ValueError('Internal commands require administrator privileges')
+    if not os.path.ismount(BOOT):
+        raise ValueError('/boot must be a mounted EFI system partition')
+    filesystem = subprocess.check_output(['/usr/bin/findmnt', '-n', '-o', 'FSTYPE', '--target', str(BOOT)], text=True).strip()
+    if filesystem != 'vfat' or not (BOOT / EFI).is_file():
+        raise ValueError('v1 requires x86-64 Limine on a FAT32 ESP mounted at /boot')
+    with open('/run/lock/boot-partition.lock', 'w') as lock:
+        # Share Omarchy's existing lock with snapshot and boot maintenance.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        before = (BOOT / CONFIG).read_text()
+        if action == '_rollback':
+            name = (STATE / 'latest').read_text()
+            if not re.fullmatch(r'backup-[a-zA-Z0-9_]+', name):
+                raise ValueError('Invalid backup reference')
+            after = restore_appearance(before, (STATE / name / CONFIG).read_text())
+            image = filename = None
+        else:
+            colors, image, extension = decode_payload(raw)
+            values = appearance(colors, image, extension)
+            after = render(before, values)
+            filename = values['wallpaper'].split('/')[1].split('#')[0]
+        if action == '_preview':
+            print(''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), 'current', 'proposed')), end='')
+            return
+        if after == before and (image is None or ((BOOT / filename).exists() and (BOOT / filename).read_bytes() == image)):
+            print('Limine already matches this theme.')
+            return
+        verify_signing_ready()
+        backup = apply_transaction(after, image, filename)
+        print(f'Limine appearance updated. Recovery copy: {backup}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', nargs='?', default='sync', choices=['sync', 'preview', 'rollback', '_apply', '_preview', '_rollback'])
+    args = parser.parse_args()
+    if args.action.startswith('_'):
+        raw = sys.stdin.buffer.read(2 * LIMIT + 1) if args.action != '_rollback' else b''
+        if len(raw) > 2 * LIMIT:
+            raise ValueError('Input is too large')
+        privileged(args.action, raw)
+    else:
+        raw = b'' if args.action == 'rollback' else theme_payload()
+        action = {'sync': '_apply', 'preview': '_preview', 'rollback': '_rollback'}[args.action]
+        result = subprocess.run(['/usr/bin/pkexec', PROGRAM, action], input=raw)
+        raise SystemExit(result.returncode)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+        print(f'omarchy-limine-theme: {error}', file=sys.stderr)
+        raise SystemExit(1)
