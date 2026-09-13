@@ -18,6 +18,7 @@ import tempfile
 import tomllib
 
 PROGRAM = '/usr/local/bin/omarchy-limine-theme'
+VERSION = '0.1.0'
 BOOT = Path('/boot')
 STATE = Path('/var/lib/omarchy-limine-theme')
 CONFIG = 'limine.conf'
@@ -26,6 +27,7 @@ CERT = Path('/var/lib/sbctl/keys/db/db.pem')
 LIMIT = 32 * 1024 * 1024
 COLOR = re.compile(r'#[0-9a-fA-F]{6}')
 ASSET = re.compile(r'limine-theme-[0-9a-f]{128}\.(png|jpg|bmp|qoi)')
+MENU_MARKER = 'comment: omarchy-limine-theme-direct'
 
 
 def read_limited(path, limit=LIMIT):
@@ -139,6 +141,58 @@ def restore_appearance(current, previous):
     return render(header + entries, values)
 
 
+def direct_menu(config, machine_id):
+    """Keep the generator-owned tree, expose a refreshed copy of its linux leaf."""
+    header, entries = split_config(config)
+    roots = list(re.finditer(r'(?m)^[ \t]*/(?!/)(\+?)([^\n]+)\n', entries))
+    blocks = [entries[m.start():roots[i + 1].start() if i + 1 < len(roots) else len(entries)]
+              for i, m in enumerate(roots)]
+    blocks = [block for block in blocks if MENU_MARKER not in block.split('//', 1)[0]]
+    owners = [block for block in blocks
+              if re.search(rf'(?m)^\s*comment:\s*machine-id={re.escape(machine_id)}(?:\s|$)', block.split('//', 1)[0])]
+    if len(owners) != 1:
+        raise ValueError('Direct menu requires exactly one machine-id tagged OS directory')
+    owner = owners[0]
+    children = list(re.finditer(r'(?m)^[ \t]*(/{2,})\+?([^\n]+)\n', owner))
+    candidates = []
+    for i, child in enumerate(children):
+        end = children[i + 1].start() if i + 1 < len(children) else len(owner)
+        body = owner[child.end():end]
+        if len(child[1]) == 2 and re.search(r'(?m)^\s*comment:\s*kernel-id=linux\s*$', body):
+            if i + 1 < len(children) and len(children[i + 1][1]) > 2:
+                raise ValueError('The primary kernel entry unexpectedly contains children')
+            candidates.append(body)
+    if len(candidates) != 1:
+        raise ValueError('Direct menu needs exactly one primary linux kernel')
+    body = candidates[0]
+    if not re.search(r'(?m)^\s*protocol:\s*efi\s*$', body) or not re.search(r'(?m)^\s*path:\s*\S+', body):
+        raise ValueError('Direct menu currently requires an EFI/UKI primary kernel')
+    options = ''.join(line for line in body.splitlines(keepends=True)
+                      if line.strip() and not line.lstrip().startswith(('#', 'comment:')))
+    shortcut = '/Omarchy\n' + MENU_MARKER + '\ncomment: Build, create, explore\n' + options + '\n'
+    recovery = re.sub(r'^[ \t]*/\+?[^\n]+', '/Recovery & snapshots', owner, count=1)
+    others = [block for block in blocks if block != owner]
+    if any(re.match(r'/\+?(?:Omarchy|Recovery & snapshots)\n', block) for block in others):
+        raise ValueError('A different entry already uses a direct-menu name')
+    windows = [block for block in others if re.search(r'(?m)^\s*entry:\s*Windows Boot Manager\s*$', block)]
+    rest = [block for block in others if block not in windows]
+    header = re.sub(r'(?mi)^default_entry:.*\n?', '', header)
+    return header + 'default_entry: Omarchy\n' + shortcut + ''.join(windows) + recovery + ''.join(rest)
+
+
+def remove_direct_menu(config):
+    if MENU_MARKER not in config:
+        return config
+    header, entries = split_config(config)
+    blocks = re.split(r'(?m)(?=^[ \t]*/(?!/)[^\n]+\n)', entries)
+    entries = ''.join(block for block in blocks if MENU_MARKER not in block.split('//', 1)[0])
+    entries = re.sub(r'(?m)^/Recovery & snapshots$', '/+Omarchy', entries)
+    header = re.sub(r'(?mi)^default_entry:.*\n?', '', header)
+    # Recovery may be requested while the last primary kernel is being removed.
+    header = re.sub(r'(?mi)^timeout:.*$', 'timeout: no', header)
+    return header + 'default_entry: 1\n' + entries
+
+
 def atomic_write(path, data, mode=0o600):
     fd, temporary = tempfile.mkstemp(prefix='.limine-theme-', dir=path.parent)
     try:
@@ -223,7 +277,13 @@ def privileged(action, raw):
         # Share Omarchy's existing lock with snapshot and boot maintenance.
         fcntl.flock(lock, fcntl.LOCK_EX)
         before = (BOOT / CONFIG).read_text()
-        if action == '_rollback':
+        if action == '_menu_off':
+            after = remove_direct_menu(before)
+            image = filename = None
+        elif action == '_menu':
+            after = direct_menu(before, Path('/etc/machine-id').read_text().strip())
+            image = filename = None
+        elif action == '_rollback':
             name = (STATE / 'latest').read_text()
             if not re.fullmatch(r'backup-[a-zA-Z0-9_]+', name):
                 raise ValueError('Invalid backup reference')
@@ -238,25 +298,55 @@ def privileged(action, raw):
             print(''.join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), 'current', 'proposed')), end='')
             return
         if after == before and (image is None or ((BOOT / filename).exists() and (BOOT / filename).read_bytes() == image)):
+            if action == '_menu_off':
+                (STATE / 'direct-menu').unlink(missing_ok=True)
+            elif action == '_menu':
+                STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+                atomic_write(STATE / 'direct-menu', b'enabled\n')
             print('Limine already matches this theme.')
             return
         verify_signing_ready()
         backup = apply_transaction(after, image, filename)
+        if action == '_menu':
+            atomic_write(STATE / 'direct-menu', b'enabled\n')
+        elif action == '_menu_off':
+            (STATE / 'direct-menu').unlink(missing_ok=True)
         print(f'Limine appearance updated. Recovery copy: {backup}')
+
+
+def refresh_menu_hook():
+    # Only called as root by the boot hook, while Omarchy already holds its lock.
+    if os.geteuid() != 0:
+        raise ValueError('Boot hook requires root')
+    if not (STATE / 'direct-menu').exists():
+        return
+    before = (BOOT / CONFIG).read_text()
+    try:
+        after = direct_menu(before, Path('/etc/machine-id').read_text().strip())
+    except ValueError as error:
+        # Never leave an obsolete direct shortcut after kernel removal.
+        after = remove_direct_menu(before)
+        print(f'Direct menu unavailable; showing generated entries: {error}', file=sys.stderr)
+    if after != before:
+        atomic_write(BOOT / CONFIG, after.encode())
+    # The existing 90-limine-enroll-config hook signs after this 85-* hook.
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', nargs='?', default='sync', choices=['sync', 'preview', 'rollback', '_apply', '_preview', '_rollback'])
+    parser.add_argument('--version', action='version', version=f'omarchy-limine-theme {VERSION}')
+    parser.add_argument('action', nargs='?', default='sync', choices=['sync', 'preview', 'rollback', 'menu', 'menu-off', '_apply', '_preview', '_rollback', '_menu', '_menu_off', '_menu_hook'])
     args = parser.parse_args()
-    if args.action.startswith('_'):
-        raw = sys.stdin.buffer.read(2 * LIMIT + 1) if args.action != '_rollback' else b''
+    if args.action == '_menu_hook':
+        refresh_menu_hook()
+    elif args.action.startswith('_'):
+        raw = sys.stdin.buffer.read(2 * LIMIT + 1) if args.action not in ('_rollback', '_menu', '_menu_off') else b''
         if len(raw) > 2 * LIMIT:
             raise ValueError('Input is too large')
         privileged(args.action, raw)
     else:
-        raw = b'' if args.action == 'rollback' else theme_payload()
-        action = {'sync': '_apply', 'preview': '_preview', 'rollback': '_rollback'}[args.action]
+        raw = b'' if args.action in ('rollback', 'menu', 'menu-off') else theme_payload()
+        action = {'sync': '_apply', 'preview': '_preview', 'rollback': '_rollback', 'menu': '_menu', 'menu-off': '_menu_off'}[args.action]
         result = subprocess.run(['/usr/bin/pkexec', PROGRAM, action], input=raw)
         raise SystemExit(result.returncode)
 

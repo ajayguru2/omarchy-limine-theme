@@ -1,0 +1,41 @@
+name: Test and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 test_theme.py
+      - run: bash -n install.sh uninstall.sh theme-set.hook boot-menu.hook release.sh
+      - run: python3 ./omarchy-limine-theme --version
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: ./release.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Publish archive and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "$RELEASE_TAG" == v0.* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "Omarchy Limine Theme $RELEASE_TAG" \
+            --notes-file CHANGELOG.md "${flags[@]}"

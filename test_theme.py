@@ -52,6 +52,28 @@ def check():
     rejects(lambda: theme.decode_payload(json.dumps({**payload, 'image': 'not base64!'})))
     rejects(lambda: theme.image_type(b'not a wallpaper'))
     rejects(lambda: theme.image_type(IMAGE[:16] + b'\xff' * 8 + IMAGE[24:]))
+    generated = CONFIG.replace('/+Omarchy\n', '/+Omarchy\ncomment: machine-id=test-machine\n')
+    generated = generated.replace('  //linux\n', '  //linux\n  comment: kernel-id=linux\n')
+    generated = generated.replace('/Windows\n', '  //Snapshots\n   ///Yesterday\n    ////linux\n    protocol: efi\n    path: boot():/old.efi\n/Windows\n')
+    direct = theme.direct_menu(generated, 'test-machine')
+    assert theme.direct_menu(direct, 'test-machine') == direct
+    assert '/Omarchy\ncomment: omarchy-limine-theme-direct\n' in direct
+    assert 'default_entry: Omarchy\n' in direct
+    assert '/Recovery & snapshots\ncomment: machine-id=test-machine\n' in direct
+    assert direct.index('/Omarchy\n') < direct.index('/Windows\n') < direct.index('/Recovery & snapshots\n')
+    assert direct.split('/Windows\n')[1].split('/Recovery & snapshots\n')[0] == generated.split('/Windows\n')[1]
+    assert direct.count('path: boot():/old.efi') == 1
+    direct_head, canonical = direct.split('/Recovery & snapshots\n')
+    refreshed = theme.direct_menu(direct_head + '/Recovery & snapshots\n' + canonical.replace('kernel.efi#1234', 'new-kernel.efi#5678'), 'test-machine')
+    assert 'path: boot():/new-kernel.efi#5678' in refreshed.split('/Windows\n')[0]
+    assert 'path: boot():/kernel.efi#1234' not in refreshed
+    disabled = theme.remove_direct_menu(refreshed)
+    assert theme.MENU_MARKER not in disabled
+    assert 'timeout: no\n' in disabled
+    assert '/+Omarchy\ncomment: machine-id=test-machine\n' in disabled
+    assert theme.remove_direct_menu(disabled) == disabled
+    rejects(lambda: theme.direct_menu(generated, 'wrong-machine'))
+    rejects(lambda: theme.direct_menu(generated.replace('kernel-id=linux', 'kernel-id=linux-lts'), 'test-machine'))
     with tempfile.TemporaryDirectory() as directory:
         theme.BOOT = Path(directory) / 'boot'
         theme.STATE = Path(directory) / 'state'
@@ -81,7 +103,7 @@ def check():
         for _ in range(4):
             theme.apply_transaction(updated, IMAGE, filename, signer=lambda: None)
         assert len(list(theme.STATE.glob('backup-*'))) == 3
-    print('PASS: palette validation, entry preservation, idempotence, alias handling, rollback after signing failure, and backup retention')
+    print('PASS: palette validation, entry preservation, idempotence, direct menu refresh/removal, signing failure recovery, and backup retention')
 
 
 if __name__ == '__main__':
